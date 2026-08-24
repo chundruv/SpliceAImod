@@ -83,14 +83,14 @@ def parse_annotation(in_path, out_path, is_gff3=False):
     print("Done!")
 
 if __name__ == '__main__':
-    gencode_in = "/Users/kartikchundru/resources/gencode.v49.annotation.gff3.gz"
+    gencode_in = "gencode.v49.annotation.gff3.gz"
     gencode_out = "spliceai/annotations/gencode.v49.annotation.txt"
     if os.path.exists(gencode_in):
         parse_annotation(gencode_in, gencode_out, is_gff3=True)
     else:
         print(f"File not found: {gencode_in}")
         
-    mane_in = "/Users/kartikchundru/resources/MANE.GRCh38.v1.4.ensembl_genomic.gtf.gz"
+    mane_in = "MANE.GRCh38.v1.4.ensembl_genomic.gtf.gz"
     mane_out = "spliceai/annotations/MANE.GRCh38.v1.4.ensembl_genomic.txt"
     if os.path.exists(mane_in):
         parse_annotation(mane_in, mane_out, is_gff3=False)
