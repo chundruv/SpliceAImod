@@ -1,0 +1,26 @@
+name: spliceai-gpu
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  # Core ML dependencies (GPU-enabled)
+  - tensorflow>=2.15.0
+  - keras>=3.0.0
+  # GPU support (CUDA 12.x)
+  - cudatoolkit=12.2
+  - cudnn=8.9
+  # Bioinformatics tools
+  - pysam>=0.21.0
+  - pyfaidx>=0.7.0
+  # Data science
+  - numpy>=1.23.0
+  - pandas>=1.5.0
+  # Additional dependencies
+  - intervaltree>=3.1.0
+  - setuptools>=65.0.0
+  # Utilities
+  - pip
+  - pip:
+    - --editable .

@@ -1,0 +1,78 @@
+{
+  "name": "spliceai",
+  "title": "spliceai",
+  "summary": "Runs SpliceAI",
+  "dxapi": "1.0.0",
+  "version": "1.0.0",
+  "inputSpec": [
+    {
+      "name": "file_prefixes",
+      "label": "file_prefixes",
+      "class": "string",
+      "optional": false,
+      "patterns": [
+        "*"
+      ],
+      "help": "file_prefixes"
+    },
+        {
+      "name": "B",
+      "label": "B",
+      "class": "string",
+      "optional": false,
+      "patterns": [
+        "*"
+      ],
+      "help": "Batch size"
+    },
+    {
+      "name": "T",
+      "label": "T",
+      "class": "string",
+      "optional": false,
+      "patterns": [
+        "*"
+      ],
+      "help": "Tensorflow array size"
+    }
+  ],
+  "outputSpec": [
+    {
+      "name": "output",
+      "label": "Output String",
+      "class": "string",
+      "help": "Output string"
+    }
+  ],
+  "runSpec": {
+    "timeoutPolicy": {
+      "*": {
+        "days": 5
+      }
+    },
+    "interpreter": "bash",
+    "release": "24.04",
+    "distribution": "Ubuntu",
+    "file": "src/spliceai.sh",
+    "version": "0",
+    "assetDepends": [
+      {"id": "record-REPLACE_WITH_YOUR_ASSET_ID"}
+    ]
+  },
+  "access": {
+    "project": "CONTRIBUTE",
+    "allProjects": "VIEW",
+  "network": [
+      "*"
+    ]
+  },
+  "regionalOptions": {
+    "aws:eu-west-2": {
+      "systemRequirements": {
+        "*": {
+          "instanceType": "mem2_ssd2_gpu1_x8"
+        }
+      }
+    }
+  }
+}

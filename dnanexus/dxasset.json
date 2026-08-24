@@ -1,0 +1,10 @@
+{
+  "name": "spliceai_cuda12_tensorflow220_asset",
+  "title": "SpliceAI CUDA 12.6 + TensorFlow 2.20 Asset",
+  "description": "Pre-built asset with CUDA 12.6 forward compatibility, TensorFlow 2.20, and all SpliceAI dependencies for Ubuntu 24.04",
+  "version": "1.0.0",
+  "distribution": "Ubuntu",
+  "release": "24.04",
+  "instanceType": "mem2_ssd2_gpu1_x4",
+  "priority": "high"
+}
