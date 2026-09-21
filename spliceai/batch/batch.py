@@ -236,7 +236,8 @@ def get_options():
     parser.add_argument('--gpu-profile-interval', type=int, default=100)
     parser.add_argument('--precision', type=str, default='auto', choices=['auto', 'fp32', 'fp16', 'bf16'])
     parser.add_argument('--compile', action='store_true', help='Use torch.compile() - can improve speed but increases warmup time')
-    parser.add_argument('--no-cuda-graphs', action='store_true', help='Enable CUDA graphs to save memory')
+    parser.add_argument('--no-cuda-graphs', action='store_true', help='Disable CUDA graphs')
+    parser.add_argument('--conv-impl', default='padded', choices=['padded', 'valid', 'valid2d'])
     parser.add_argument('--workers-per-gpu', type=int, default=1)
     # How many sibling CPU worker processes exist. Used only to divide the
     # available cores between them (see calculate_optimal_threads).
@@ -332,6 +333,7 @@ class VCFPredictionBatch:
         self.cuda_graphs = {}
         self.static_inputs = {}
         self.static_outputs = {}
+        self._graph_capture_failed = set()
 
         # Profiling
         self.gpu_profile_interval = getattr(args, 'gpu_profile_interval', 100)
@@ -438,13 +440,17 @@ class VCFPredictionBatch:
             fused.eval()
             if model_dtype in (torch.float16, torch.bfloat16):
                 fused = fused.to(model_dtype)
-            self.fused_model = fused
+            conv_impl = getattr(self.args, 'conv_impl', 'padded') or 'padded'
+            from spliceai.batch.fused_valid import wrap_conv_impl
+            runner = wrap_conv_impl(fused, conv_impl)
+            runner.eval()
+            self.fused_model = runner
             self.logger.info(
                 f"Worker {self.worker_id}: FUSED grouped-conv ensemble active "
-                f"(groups=5, {fused.wide} channels, dtype={model_dtype})")
+                f"(groups=5, {fused.wide} channels, dtype={model_dtype}, conv_impl={conv_impl})")
 
             def fused_forward(x):
-                return fused(x)
+                return runner(x)
 
             return fused_forward
         except Exception as e:
@@ -654,7 +660,11 @@ class VCFPredictionBatch:
         self.logger.info(f"Worker {self.worker_id}: Warming up...")
         warmup_start = time.time()
 
-        SPLICEAI_INPUT_LENGTH = 25001
+        # Window the batch producers actually emit: 10000 bp of context plus
+        # the +/- distance region. The old hardcoded 25001 never matched a real
+        # batch at -D 500 (11001), so the graph captured here was never replayed
+        # and every batch ran eager.
+        SPLICEAI_INPUT_LENGTH = 10000 + 2 * int(getattr(self.args, 'distance', 500) or 500) + 1
         batch_size = self.pytorch_batch_size or 128
         
         # Get model dtype
@@ -665,16 +675,22 @@ class VCFPredictionBatch:
         self.cuda_graphs = {}
         self.static_inputs = {}
         self.static_outputs = {}
+        self._graph_capture_failed = set()
         
-        # CUDA graphs are disabled by default - use --no-cuda-graphs to disable
-        self.use_cuda_graphs = False
+        # CUDA graphs are on by default on GPU; --no-cuda-graphs disables them.
+        # Capture is LAZY: _process_batch captures a graph the first time it
+        # sees a full-size chunk, keyed on the real (batch, seq_len). That works
+        # with and without --compile (a compiled callable is capturable once it
+        # has been traced), and it cannot key on the wrong shape.
         no_cuda_graphs_flag = getattr(self.args, 'no_cuda_graphs', False)
+        self.use_cuda_graphs = (not is_cpu) and torch.cuda.is_available() and not no_cuda_graphs_flag
         
         # Check if we're using torch.compile - skip warmup to avoid OOM
         # torch.compile will JIT compile on first real batch instead
         use_compile = getattr(self.args, 'compile', False)
         if use_compile:
             self.logger.info(f"Worker {self.worker_id}: Skipping warmup (torch.compile will JIT on first batch)")
+            self.logger.info(f"Worker {self.worker_id}: CUDA graphs {'enabled (lazy capture)' if self.use_cuda_graphs else 'disabled'}")
             self.warmup_done = True
             self.logger.info(f"Worker {self.worker_id}: Warmup done in {time.time() - warmup_start:.2f}s")
             return
@@ -709,58 +725,70 @@ class VCFPredictionBatch:
             except:
                 pass
 
-        # CUDA graphs - only if explicitly enabled and we have enough memory
-        if not is_cpu and torch.cuda.is_available() and no_cuda_graphs_flag is False:
-            try:
-                free_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated()
-                free_memory_gb = free_memory / (1024**3)
-                # 10GB free for CUDA graph capture
-                if free_memory_gb > 10.0:
-                    self.use_cuda_graphs = True
-                    self.logger.info(f"Worker {self.worker_id}: CUDA graphs enabled ({free_memory_gb:.1f}GB free)")
-                else:
-                    self.logger.info(f"Worker {self.worker_id}: CUDA graphs disabled (only {free_memory_gb:.1f}GB free)")
-            except Exception as e:
-                self.logger.debug(f"Worker {self.worker_id}: Could not check GPU memory: {e}")
-
-        # CUDA Graph capture (skip for memory-constrained GPUs)
-        if self.use_cuda_graphs:
-            try:
-                self._capture_cuda_graph(batch_size, SPLICEAI_INPUT_LENGTH, model_dtype)
-                self.logger.info(f"Worker {self.worker_id}: CUDA graph captured for batch_size={batch_size}")
-            except Exception as e:
-                self.logger.warning(f"Worker {self.worker_id}: CUDA graph capture failed, continuing without: {e}")
-                self.use_cuda_graphs = False
-                self.cuda_graphs = {}
-                self.static_inputs = {}
-                self.static_outputs = {}
-                gc.collect()
-                torch.cuda.empty_cache()
-        
+        self.logger.info(f"Worker {self.worker_id}: CUDA graphs {'enabled (lazy capture)' if self.use_cuda_graphs else 'disabled'}")
         self.warmup_done = True
         self.logger.info(f"Worker {self.worker_id}: Warmup done in {time.time() - warmup_start:.2f}s")
 
-    def _capture_cuda_graph(self, batch_size, seq_length, dtype):
-        """Capture CUDA graph for a specific batch size - reduces CPU overhead significantly"""
+    def _capture_cuda_graph(self, batch_size, seq_length, dtype, sample=None):
+        """Capture a CUDA graph for one (batch, seq_len) shape.
+
+        Warm-up runs on a side stream before capture, as the PyTorch docs
+        require, so cuDNN autotuning (cudnn.benchmark) and any torch.compile
+        tracing happen outside the captured region. `sample` (a real chunk)
+        seeds the static input so the warm-up sees realistic data.
+        """
         graph_key = (batch_size, seq_length)
-        
-        # Allocate static tensors
+
         static_input = torch.zeros(batch_size, 4, seq_length, dtype=dtype, device=self.device)
-        
-        # Warmup before capture
+        if sample is not None:
+            static_input.copy_(sample)
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                _ = self.ensemble_forward(static_input)
+        torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
-        for _ in range(3):
-            _ = self.ensemble_forward(static_input)
-        torch.cuda.synchronize()
-        
-        # Capture graph
+        # Return the warm-up's cached activations to the driver so the graph's
+        # private pool can reuse that physical memory instead of doubling it.
+        gc.collect()
+        torch.cuda.empty_cache()
+
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             static_output = self.ensemble_forward(static_input)
-        
+        torch.cuda.synchronize()
+
         self.cuda_graphs[graph_key] = g
         self.static_inputs[graph_key] = static_input
         self.static_outputs[graph_key] = static_output
+
+    def _maybe_capture(self, graph_key, chunk, model_dtype):
+        """Lazily capture a graph for a full-size chunk the first time it is seen.
+
+        Only full chunks (== -T) are captured: the ragged last chunk of a batch
+        would cost a capture for a shape seen once per shard. Failure (usually
+        OOM during capture) is remembered per shape and that shape runs eager.
+        """
+        if graph_key in self.cuda_graphs or graph_key in self._graph_capture_failed:
+            return
+        batch_size, seq_length = graph_key
+        t0 = time.time()
+        try:
+            self._capture_cuda_graph(batch_size, seq_length, model_dtype, sample=chunk)
+            mem = torch.cuda.memory_allocated() / 1024**3
+            self.logger.info(f"Worker {self.worker_id}: CUDA graph captured for shape {graph_key} "
+                             f"in {time.time() - t0:.1f}s ({mem:.1f}GB allocated)")
+        except Exception as e:
+            self._graph_capture_failed.add(graph_key)
+            self.cuda_graphs.pop(graph_key, None)
+            self.static_inputs.pop(graph_key, None)
+            self.static_outputs.pop(graph_key, None)
+            gc.collect()
+            torch.cuda.empty_cache()
+            self.logger.warning(f"Worker {self.worker_id}: CUDA graph capture failed for shape {graph_key}, "
+                                f"running eager for this shape: {e}")
 
     def _process_batch(self, tensor_size, batch_ix, prediction_batch, nr_preds, batch_count):
         """Optimized batch processing with CUDA graph support"""
@@ -815,6 +843,9 @@ class VCFPredictionBatch:
                 chunk = input_tensor[i:i+pytorch_batch_size]
                 chunk_batch_size = chunk.shape[0]
                 graph_key = (chunk_batch_size, seq_length)
+
+                if self.use_cuda_graphs and chunk_batch_size == pytorch_batch_size:
+                    self._maybe_capture(graph_key, chunk, model_dtype)
 
                 # Try to use CUDA graph if available and batch size matches
                 if self.use_cuda_graphs and graph_key in self.cuda_graphs:

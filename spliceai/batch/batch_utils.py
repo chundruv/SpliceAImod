@@ -490,6 +490,7 @@ def start_workers(prediction_queue, tmpdir, args, devices, device_info, workers_
                 cmd.append('--compile')
             if getattr(args, 'no_cuda_graphs', False):
                 cmd.append('--no-cuda-graphs')
+            cmd += ['--conv-impl', str(getattr(args, 'conv_impl', 'padded') or 'padded')]
 
             env = os.environ.copy()
             if not is_cpu_device:
