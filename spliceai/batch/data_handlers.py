@@ -68,7 +68,9 @@ class VCFReader:
         if not self.batches.get(tensor_size):
             return
 
-        data_np = np.concatenate(self.batches[tensor_size])
+        # uint8 one-hot: lossless (values are 0/1), 4x less disk I/O than float32;
+        # the GPU worker casts to the model dtype on device.
+        data_np = np.concatenate(self.batches[tensor_size]).astype(np.uint8, copy=False)
         logger.debug(f"Flushing size {tensor_size}: {len(data_np)} seqs to batch {self.batch_counters[tensor_size]}")
         
         queue_item = {

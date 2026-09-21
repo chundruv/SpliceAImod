@@ -271,7 +271,12 @@ def _batch_worker_process(worker_id, work_queue, prediction_queue,
         if not batches.get(tensor_size):
             return
         
-        data_np = np.concatenate(batches[tensor_size])
+        # One-hot values are exactly 0/1, so uint8 is lossless and the pickle is
+        # 4x smaller than float32 (0.9 GB vs 3.6 GB at -B 20480). The GPU worker
+        # casts to the model dtype on device, so nothing downstream changes. This
+        # matters on hosts with slow scratch disks (Colab's /content, network
+        # PDs): at float32 the batch pickles saturate the disk and the GPU idles.
+        data_np = np.concatenate(batches[tensor_size]).astype(np.uint8, copy=False)
         if batch_counters[tensor_size] >= BATCH_ID_STRIDE:
             raise RuntimeError(
                 f"Batch worker {worker_id} has emitted {batch_counters[tensor_size]} "

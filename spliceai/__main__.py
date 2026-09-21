@@ -293,7 +293,7 @@ def run_spliceai_batched(args, ann, devices, device_info):
             available_disk_gb = 50
 
         # Memory estimation
-        bytes_per_sequence = 10000 * 4 * 4  # ~160 KB
+        bytes_per_sequence = 11001 * 4 * 1  # uint8 one-hot on disk, ~44 KB
         batch_memory_mb = (prediction_batch_size * bytes_per_sequence) / (1024 * 1024)
 
         num_workers = len(devices) * args.workers_per_gpu

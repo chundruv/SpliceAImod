@@ -42,7 +42,7 @@ SpliceAI can be run from the command line:
 ```
 spliceai \
     -I input.bcf \
-    -O output.vcf.gz \
+    -O output.tsv.gz \
     -D 500 \
     -R genome.fa \
     -A spliceai/annotations/gencode.v49.annotation.txt \
