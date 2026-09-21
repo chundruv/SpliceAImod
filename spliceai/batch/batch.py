@@ -685,15 +685,17 @@ class VCFPredictionBatch:
         no_cuda_graphs_flag = getattr(self.args, 'no_cuda_graphs', False)
         self.use_cuda_graphs = (not is_cpu) and torch.cuda.is_available() and not no_cuda_graphs_flag
         
-        # Check if we're using torch.compile - skip warmup to avoid OOM
-        # torch.compile will JIT compile on first real batch instead
+        # Warm up at the real (batch, length) shape whether or not --compile is
+        # set. With --compile this is where Inductor traces and compiles the
+        # graph (~40 s on an A100), which otherwise lands on the first real
+        # batch. The GPU worker is ready long before the batch producers have
+        # filled their first batch, so doing it here overlaps the compile with
+        # that wait instead of serialising the two. Memory is the same as one
+        # inference chunk, so there is no OOM risk beyond what inference has.
         use_compile = getattr(self.args, 'compile', False)
         if use_compile:
-            self.logger.info(f"Worker {self.worker_id}: Skipping warmup (torch.compile will JIT on first batch)")
-            self.logger.info(f"Worker {self.worker_id}: CUDA graphs {'enabled (lazy capture)' if self.use_cuda_graphs else 'disabled'}")
-            self.warmup_done = True
-            self.logger.info(f"Worker {self.worker_id}: Warmup done in {time.time() - warmup_start:.2f}s")
-            return
+            self.logger.info(f"Worker {self.worker_id}: warming up compiled graph at "
+                             f"({batch_size}, 4, {SPLICEAI_INPUT_LENGTH}) while batches are prepared")
 
         with torch.inference_mode():
             for i in range(2):  # Fewer warmup iterations
