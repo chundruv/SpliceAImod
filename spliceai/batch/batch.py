@@ -237,7 +237,7 @@ def get_options():
     parser.add_argument('--precision', type=str, default='auto', choices=['auto', 'fp32', 'fp16', 'bf16'])
     parser.add_argument('--compile', action='store_true', help='Use torch.compile() - can improve speed but increases warmup time')
     parser.add_argument('--no-cuda-graphs', action='store_true', help='Disable CUDA graphs')
-    parser.add_argument('--conv-impl', default='padded', choices=['padded', 'valid', 'valid2d'])
+    parser.add_argument('--conv-impl', default='padded', choices=['padded', 'valid', 'valid2d', 'valid_nhwc'])
     parser.add_argument('--workers-per-gpu', type=int, default=1)
     # How many sibling CPU worker processes exist. Used only to divide the
     # available cores between them (see calculate_optimal_threads).

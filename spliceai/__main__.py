@@ -108,13 +108,14 @@ def get_options():
     parser.add_argument('--compile', 
                         action='store_true',
                         help='Use torch.compile() for optimized inference (requires PyTorch 2.0+)')
-    parser.add_argument('--conv-impl', default='padded', choices=['padded', 'valid', 'valid2d'],
+    parser.add_argument('--conv-impl', default='padded', choices=['padded', 'valid', 'valid2d', 'valid_nhwc'],
                         help="GPU conv implementation for the fused ensemble. 'padded' is the "
                              "as-shipped graph; 'valid' skips computing the positions the CL//2 "
                              "crop discards (exact, ~32%% fewer FLOPs at -D 500); 'valid2d' "
                              "additionally runs dilated convs as dense conv2d on an (L/ar, ar) "
-                             "view, which cuDNN handles far better than dilated conv1d. "
-                             "(default: padded)")
+                             "view; 'valid_nhwc' runs the unpadded network in channels_last "
+                             "so cuDNN's tensor-core kernels skip the NCHW<->NHWC transposes "
+                             "around every conv (fastest on Ampere+). (default: padded)")
     parser.add_argument('--no-cuda-graphs', 
                         action='store_true',
                         help='Disable CUDA Graphs optimization')

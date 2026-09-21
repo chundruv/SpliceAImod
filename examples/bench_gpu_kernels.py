@@ -93,7 +93,7 @@ def main():
     base = bench('fused fp16 (as shipped)', fused16, x16)
 
     from spliceai.batch.fused_valid import wrap_conv_impl
-    for impl in ('valid', 'valid2d'):
+    for impl in ('valid', 'valid2d', 'valid_nhwc'):
         v = wrap_conv_impl(fused16, impl).eval()
         bench(f'fused fp16 conv_impl={impl}', v, x16)
         try:
@@ -126,8 +126,8 @@ def main():
     if not a.no_profile:
         print('\nTop CUDA kernels, fused fp16 baseline (padded):')
         profile(fused16, x16)
-        print('\nTop CUDA kernels, conv_impl=valid2d:')
-        profile(wrap_conv_impl(fused16, 'valid2d').eval(), x16)
+        print('\nTop CUDA kernels, conv_impl=valid_nhwc:')
+        profile(wrap_conv_impl(fused16, 'valid_nhwc').eval(), x16)
 
 
 if __name__ == '__main__':

@@ -25,7 +25,16 @@
 #                kernels are far better tuned than its dilated ones, and the
 #                output view interleaves the phases back with no permute.
 #
-# All three are validated against the padded fused model in tests/ (max abs
+#   nhwc      -- cuDNN's tensor-core conv kernels are NHWC-native. Given NCW
+#                input they transpose in and out around EVERY conv
+#                (nchwToNhwcKernel / nhwcToNchwKernel: ~17% of GPU time on an
+#                A100 at fp16). Running the network as conv2d over an
+#                (N, C, 1, L) tensor held in channels_last memory format lets
+#                cuDNN consume and produce NHWC directly, so those transposes
+#                disappear. Elementwise ops preserve the format, so the whole
+#                forward stays NHWC. Numerically identical.
+#
+# All are validated against the padded fused model in tests/ (max abs
 # deviation at fp32 is reassociation-level, ~1e-6).
 
 import math
@@ -36,13 +45,18 @@ import torch.nn.functional as F
 
 from spliceai.batch.fused_inference import FusedSpliceAIEnsemble, _module_layout
 
-CONV_IMPLS = ('padded', 'valid', 'valid2d')
+CONV_IMPLS = ('padded', 'valid', 'valid2d', 'valid_nhwc')
 
 
 def _bn_affine(bn):
     a = bn.weight / torch.sqrt(bn.running_var + bn.eps)
     b = bn.bias - a * bn.running_mean
     return a, b
+
+
+def _valid_conv_nhwc(x4, weight4, bias, ar, groups):
+    """Unpadded conv over (N, C, 1, L) channels_last with kernel (1, w), dilation (1, ar)."""
+    return F.conv2d(x4, weight4, bias, dilation=(1, ar), groups=groups)
 
 
 def _dilated_valid_conv(x, weight, bias, ar, groups, use_2d):
@@ -69,13 +83,14 @@ class ValidFusedSpliceAIEnsemble(nn.Module):
     forward(x) -> (N, 3, L - CL) fp32, identical to FusedSpliceAIEnsemble.
     """
 
-    def __init__(self, fused: FusedSpliceAIEnsemble, use_2d=True, fold_bn=True):
+    def __init__(self, fused: FusedSpliceAIEnsemble, use_2d=True, fold_bn=True, nhwc=False):
         super().__init__()
         self.fused = fused
         self.n_models = fused.n_models
         self.groups = fused.n_models
-        self.use_2d = use_2d
+        self.use_2d = use_2d and not nhwc
         self.fold_bn = fold_bn
+        self.nhwc = nhwc
         self.CL = fused.CL
         self.layout = _module_layout()
 
@@ -95,7 +110,72 @@ class ValidFusedSpliceAIEnsemble(nn.Module):
                     self.folded_w.append(nn.Parameter(w, requires_grad=False))
                     self.folded_b.append(nn.Parameter(bb, requires_grad=False))
 
+        # NHWC: pre-build 4-D (Cout, Cin/g, 1, w) channels_last weights once.
+        self.w4 = {}
+        if nhwc:
+            cl = torch.channels_last
+            with torch.no_grad():
+                def to4(w):
+                    return nn.Parameter(w.detach().unsqueeze(2).contiguous(memory_format=cl),
+                                        requires_grad=False)
+                self.w4_initial = to4(fused.initial_conv.weight)
+                self.w4_initial_skip = to4(fused.initial_skip.conv.weight)
+                self.w4_final = to4(fused.final_conv.weight)
+                self.w4_conv1 = nn.ParameterList()
+                self.w4_conv2 = nn.ParameterList()
+                self.w4_skip = nn.ParameterList()
+                ru_i = 0
+                for mi, spec in enumerate(self.layout):
+                    m = fused.residual_units[mi]
+                    if spec[0] == 'RU':
+                        w1 = self.folded_w[ru_i] if fold_bn else m.conv1.weight
+                        self.w4_conv1.append(to4(w1))
+                        self.w4_conv2.append(to4(m.conv2.weight))
+                        ru_i += 1
+                    else:
+                        self.w4_skip.append(to4(m.conv.weight))
+
+    def _forward_nhwc(self, x):
+        f = self.fused
+        N = x.shape[0]
+        cl = torch.channels_last
+        x = x.unsqueeze(2).contiguous(memory_format=cl)             # (N, 4, 1, L)
+        x = F.conv2d(x, self.w4_initial, f.initial_conv.bias)
+        skip = F.conv2d(x, self.w4_initial_skip, f.initial_skip.conv.bias, groups=self.groups)
+        ru_i = 0
+        sk_i = 0
+        for mi, spec in enumerate(self.layout):
+            m = f.residual_units[mi]
+            if spec[0] == 'RU':
+                _, w, ar = spec
+                p = (w - 1) * ar // 2
+                out = torch.relu(F.batch_norm(x, m.bn1.running_mean, m.bn1.running_var,
+                                              m.bn1.weight, m.bn1.bias, False, 0.0, m.bn1.eps))
+                if self.fold_bn:
+                    out = _valid_conv_nhwc(out, self.w4_conv1[ru_i], self.folded_b[ru_i], ar, self.groups)
+                    out = torch.relu(out)
+                else:
+                    out = _valid_conv_nhwc(out, self.w4_conv1[ru_i], m.conv1.bias, ar, self.groups)
+                    out = torch.relu(F.batch_norm(out, m.bn2.running_mean, m.bn2.running_var,
+                                                  m.bn2.weight, m.bn2.bias, False, 0.0, m.bn2.eps))
+                out = _valid_conv_nhwc(out, self.w4_conv2[ru_i], m.conv2.bias, ar, self.groups)
+                x = x[:, :, :, 2 * p:x.shape[-1] - 2 * p] + out
+                ru_i += 1
+            else:
+                d = (skip.shape[-1] - x.shape[-1]) // 2
+                if d > 0:
+                    skip = skip[:, :, :, d:skip.shape[-1] - d]
+                skip = F.conv2d(x, self.w4_skip[sk_i], m.conv.bias, groups=self.groups) + skip
+                sk_i += 1
+        out = F.conv2d(skip, self.w4_final, f.final_conv.bias, groups=self.groups)  # (N, 3n, 1, Lout)
+        Lout = out.shape[-1]
+        out = out.reshape(N, self.n_models, 3, Lout)
+        out = F.softmax(out, dim=2)
+        return out.float().mean(dim=1)
+
     def forward(self, x):
+        if self.nhwc:
+            return self._forward_nhwc(x)
         f = self.fused
         N = x.shape[0]
         x = f.initial_conv(x)
@@ -139,4 +219,6 @@ def wrap_conv_impl(fused, conv_impl):
         return ValidFusedSpliceAIEnsemble(fused, use_2d=False, fold_bn=True)
     if conv_impl == 'valid2d':
         return ValidFusedSpliceAIEnsemble(fused, use_2d=True, fold_bn=True)
+    if conv_impl == 'valid_nhwc':
+        return ValidFusedSpliceAIEnsemble(fused, fold_bn=True, nhwc=True)
     raise ValueError(f"unknown conv_impl {conv_impl!r}; choose from {CONV_IMPLS}")
