@@ -12,6 +12,7 @@
 #   examples/colab_master.sh watch                 # poll; `colab stop` each session once its driver exits
 #   examples/colab_master.sh stop                  # stop every session now
 #   examples/colab_master.sh sessions              # list the sessions this script knows about
+#   examples/colab_master.sh diag SESSION          # processes / GPU / outputs / worker log on one VM
 #
 # Everything the on-VM step does lives in examples/colab_run.py; this script only moves it
 # there and runs it. Per-run settings are environment variables passed through to it:
@@ -67,7 +68,7 @@ exec_retry() {  # exec_retry SESSION  (code on stdin)
   return 1
 }
 
-driver_alive_py='import subprocess;print("ALIVE" if subprocess.run(["pgrep","-f","python /content/[c]olab_driver.py"],capture_output=True).returncode==0 else "DEAD")'
+driver_alive_py='import subprocess;print("ALIVE" if subprocess.run(["pgrep","-f","python[0-9.]* /content/[c]olab_driver.py"],capture_output=True).returncode==0 else "DEAD")'
 tail_py='import glob;l=sorted(glob.glob("/content/drive/MyDrive/spliceai_run/logs/driver_*.log"));print(open(l[-1]).read()[-1500:] if l else "no log")'
 
 cmd=${1:-launch}
@@ -118,6 +119,21 @@ case "$cmd" in
     ;;
   sessions)
     sessions
+    ;;
+  diag)
+    # what is actually running on the VM: driver/spliceai processes, GPU, claims, GPU-worker log tail
+    S=${2:?session name}
+    cat <<'PY' | colab exec -s "$S"
+import subprocess, glob
+cmd = r'''
+echo "--- processes"; ps -eo pid,etime,pcpu,cmd | grep -E "colab_driver|spliceai|batch\.py" | grep -v grep
+echo "--- gpu"; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
+echo "--- drive out/"; ls /content/drive/MyDrive/spliceai_run/out 2>/dev/null | tail -n 20
+echo "--- driver log tail"; tail -n 8 $(ls -t /content/drive/MyDrive/spliceai_run/logs/driver_*.log | head -1)
+echo "--- gpu worker stderr tail"; tail -n 12 /content/work/tmp/*/GPU_0_w0.stderr 2>/dev/null || echo none
+'''
+print(subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout)
+PY
     ;;
   *) echo "unknown command $cmd"; exit 2;;
 esac

@@ -172,11 +172,11 @@ def launch_driver():
     shutil.copy(os.path.join(REPO_DIR, "examples", "colab_driver.py"), "/content/colab_driver.py")
     if not LAUNCH:
         log("LAUNCH=0: setup complete, driver not started"); return
-    if subprocess.run(["pgrep", "-f", "python /content/[c]olab_driver.py"], capture_output=True).returncode == 0:
+    if subprocess.run(["pgrep", "-f", "python[0-9.]* /content/[c]olab_driver.py"], capture_output=True).returncode == 0:
         log("driver already running"); return
     logf = f"{CFG['DRIVE_LOGS']}/driver_{time.strftime('%Y%m%d_%H%M%S')}.log"
     env = {**os.environ, "COLAB_AUTO_UNASSIGN": AUTO_UNASSIGN}
-    subprocess.Popen(f"nohup python /content/colab_driver.py > {logf} 2>&1 &", shell=True, env=env)
+    subprocess.Popen(f"nohup python3 /content/colab_driver.py > {logf} 2>&1 &", shell=True, env=env)
     log(f"driver launched; log: {logf}")
 
 
