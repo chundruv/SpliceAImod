@@ -3,7 +3,10 @@
 # driver on each, then (optionally) watch them and release each VM when its driver exits.
 #
 # Needs the official Colab CLI:  pip install google-colab-cli   (then `colab auth` once)
-# and the input BCF (+ .csi) already at  $DRIVE_ROOT/input/  on your Google Drive.
+# and the pre-cut shards uploaded to the bucket:  gsutil -m cp shards/* $GCS_ROOT/shards/
+# Bucket mode (recommended): GCS_ROOT=gs://var-annot-transfer-uk — no Google Drive involved.
+# Headless auth for the bucket: GCS_KEY_FILE=<service-account json path ON THE VM> (upload it with
+# `colab upload -s NAME key.json /content/key.json` first).
 #
 # Usage:
 #   examples/colab_master.sh launch [N] [GPU]      # default N=1, GPU=A100
@@ -18,9 +21,8 @@
 # Everything the on-VM step does lives in examples/colab_run.py; this script only moves it
 # there and runs it. Per-run settings are environment variables passed through to it:
 #   DRIVE_ROOT INPUT_BCF ANNOTATION DISTANCE VARIANTS_PER_SHARD PRED_BATCH TORCH_BATCH
-#   BATCH_WORKERS PRECISION EXTRA_FLAGS REPO_BRANCH
-# e.g.  REPO_BRANCH=bench INPUT_BCF=/content/drive/MyDrive/spliceai_run/input/near_splice.bcf \
-#       examples/colab_master.sh launch 4
+#   BATCH_WORKERS PRECISION EXTRA_FLAGS REPO_BRANCH GCS_ROOT GCS_KEY_FILE
+# e.g.  GCS_ROOT=gs://var-annot-transfer-uk GCS_KEY_FILE=/content/key.json examples/colab_master.sh launch 4
 set -euo pipefail
 
 PREFIX=${SESSION_PREFIX:-spliceai}
@@ -74,7 +76,7 @@ exec_retry() {  # exec_retry SESSION [TIMEOUT]  (code on stdin)
 }
 
 driver_alive_py='import subprocess;print("ALIVE" if subprocess.run(["pgrep","-f","python[0-9.]* /content/[c]olab_driver.py"],capture_output=True).returncode==0 else "DEAD")'
-tail_py='import glob;l=sorted(glob.glob("/content/drive/MyDrive/spliceai_run/logs/driver_*.log"));print(open(l[-1]).read()[-1500:] if l else "no log")'
+tail_py='import glob;l=sorted(glob.glob("/content/work/logs/driver_*.log")+glob.glob("/content/drive/MyDrive/spliceai_run/logs/driver_*.log"));print(open(l[-1]).read()[-1500:] if l else "no log")'
 
 cmd=${1:-launch}
 case "$cmd" in
@@ -89,8 +91,7 @@ case "$cmd" in
       echo "== $S: provisioning $GPU"
       colab new -s "$S" --gpu "$GPU"
       remember "$S"
-      colab drivemount -s "$S"
-      sleep 5
+      if [ -z "${GCS_ROOT:-}" ]; then colab drivemount -s "$S"; sleep 5; fi   # bucket mode needs no Drive
       echo "== $S: bootstrapping (install, reference, shards) and launching driver"
       bootstrap_py | exec_retry "$S"
     done
@@ -137,8 +138,7 @@ import subprocess, glob
 cmd = r'''
 echo "--- processes"; ps -eo pid,etime,pcpu,cmd | grep -E "colab_driver|spliceai|batch\.py" | grep -v grep
 echo "--- gpu"; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
-echo "--- drive out/"; ls /content/drive/MyDrive/spliceai_run/out 2>/dev/null | tail -n 20
-echo "--- driver log tail"; tail -n 8 $(ls -t /content/drive/MyDrive/spliceai_run/logs/driver_*.log | head -1)
+echo "--- driver log tail"; tail -n 8 $(ls -t /content/work/logs/driver_*.log /content/drive/MyDrive/spliceai_run/logs/driver_*.log 2>/dev/null | head -1)
 echo "--- gpu worker stderr tail"; tail -n 12 /content/work/tmp/*/GPU_0_w0.stderr 2>/dev/null || echo none
 '''
 print(subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout)

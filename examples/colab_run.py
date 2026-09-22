@@ -28,13 +28,15 @@ defaults as the notebook's cell 1:
   SHARDS_URL            (none)  HTTPS base URL serving shards.json and shard_*.vcf.gz, e.g. a
                                 GitHub release: https://github.com/<user>/<repo>/releases/download/<tag>
                                 Used instead of SHARDS_DIR, so Drive holds no shards at all.
-  GCS_ROOT              (none)  gs://bucket/prefix. Shards are read from $GCS_ROOT/shards/ and
-                                results written to $GCS_ROOT/out/; Drive then holds only the
-                                claims / .done markers / manifest / logs. Auth: in a browser
-                                notebook run `from google.colab import auth; auth.authenticate_user()`
-                                first; headless, put a service-account key on Drive and set
-                                GCS_KEY_FILE to its path (roles/storage.objectAdmin on the bucket).
-  GCS_KEY_FILE          (none)  service-account JSON for gsutil (see GCS_ROOT)
+  GCS_ROOT              (none)  gs://bucket[/prefix]. Bucket-only mode, NO Drive: shards from
+                                $GCS_ROOT/shards/, results to $GCS_ROOT/out/, claims/markers/logs
+                                under $GCS_ROOT/state/. Auth: in a browser notebook run
+                                `from google.colab import auth; auth.authenticate_user()` first;
+                                headless, set GCS_KEY_FILE to a service-account JSON
+                                (roles/storage.objectAdmin on the bucket).
+  GCS_KEY_FILE          (none)  service-account JSON for the bucket (see GCS_ROOT)
+  GCP_PROJECT           colab   project id passed to the storage client (any string works for
+                                object access on a non-requester-pays bucket)
   CACHE_REF             0/1  copy a freshly downloaded reference back to Drive (default 0)
   REPO_DIR              /content/SpliceAImod  (must already be cloned + pip installed, or
                                                set INSTALL=1 to do it here)
@@ -54,6 +56,7 @@ CFG = dict(
     SHARDS_DIR=E("SHARDS_DIR", f"{DRIVE_ROOT}/shards"),
     SHARDS_URL=E("SHARDS_URL", "").rstrip("/"),
     GCS_ROOT=E("GCS_ROOT", "").rstrip("/"),
+    GCP_PROJECT=E("GCP_PROJECT", "colab"),
     REF_ON_DRIVE=E("REF_ON_DRIVE", f"{DRIVE_ROOT}/ref/GRCh38.fa"),
     REF_URL=E("REF_URL", "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/"
                          "seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"),
@@ -68,14 +71,16 @@ CFG = dict(
     EXTRA_FLAGS=E("EXTRA_FLAGS", "--compile --conv-impl valid_nhwc"),
     LOCAL=E("LOCAL", "/content/work"),
 )
+GCS = bool(CFG["GCS_ROOT"])
 CFG.update(
     LOCAL_REF=f"{CFG['LOCAL']}/ref/GRCh38.fa",
     LOCAL_SHARDS=f"{CFG['LOCAL']}/shards",
     LOCAL_OUT=f"{CFG['LOCAL']}/out",
     LOCAL_TMP=f"{CFG['LOCAL']}/tmp",
     DRIVE_OUT=f"{DRIVE_ROOT}/out",
-    DRIVE_LOGS=f"{DRIVE_ROOT}/logs",
-    MANIFEST=f"{DRIVE_ROOT}/shards.json",
+    # bucket mode keeps logs and the manifest on the VM (the driver mirrors its log to the bucket)
+    DRIVE_LOGS=f"{CFG['LOCAL']}/logs" if GCS else f"{DRIVE_ROOT}/logs",
+    MANIFEST=f"{CFG['LOCAL']}/shards.json" if GCS else f"{DRIVE_ROOT}/shards.json",
 )
 REPO_DIR = E("REPO_DIR", "/content/SpliceAImod")
 INSTALL = E("INSTALL", "0") == "1"
@@ -93,25 +98,35 @@ def sh(cmd, **kw):
 
 
 def main():
-    for d in (f"{CFG['LOCAL']}/ref", CFG["LOCAL_SHARDS"], CFG["LOCAL_OUT"], CFG["LOCAL_TMP"],
-              CFG["DRIVE_OUT"], CFG["DRIVE_LOGS"], f"{DRIVE_ROOT}/input", f"{DRIVE_ROOT}/ref"):
+    dirs = [f"{CFG['LOCAL']}/ref", CFG["LOCAL_SHARDS"], CFG["LOCAL_OUT"], CFG["LOCAL_TMP"], CFG["DRIVE_LOGS"]]
+    if not GCS:
+        dirs += [CFG["DRIVE_OUT"], f"{DRIVE_ROOT}/input", f"{DRIVE_ROOT}/ref"]
+    for d in dirs:
         os.makedirs(d, exist_ok=True)
     json.dump(CFG, open("/content/run_config.json", "w"), indent=1)
     log("config written to /content/run_config.json")
 
-    if not os.path.isdir(DRIVE_ROOT):
-        sys.exit(f"Drive not mounted: {DRIVE_ROOT}")
-    if CFG["GCS_ROOT"]:
+    if GCS:
         if E("GCS_KEY_FILE"):
-            sh(f"gcloud -q auth activate-service-account --key-file {E('GCS_KEY_FILE')}")
-        # fail early and clearly if the bucket is not reachable
-        sh(f"gsutil -q ls {CFG['GCS_ROOT']}/shards/shards.json")
-        if not os.path.exists(CFG["MANIFEST"]):
-            sh(f"gsutil -q cp {CFG['GCS_ROOT']}/shards/shards.json {CFG['MANIFEST']}")
-    elif CFG["SHARDS_URL"] and not os.path.exists(CFG["MANIFEST"]):
+            os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = E("GCS_KEY_FILE")
+        # fail early and clearly if the bucket is not reachable / not authorised
+        from google.cloud import storage
+        root = CFG["GCS_ROOT"][len("gs://"):]
+        bucket_name, _, prefix = root.partition("/")
+        client = storage.Client(project=CFG["GCP_PROJECT"])
+        key = "/".join(x for x in (prefix.strip("/"), "shards/shards.json") if x)
+        blob = client.bucket(bucket_name).blob(key)
+        if not blob.exists():
+            sys.exit(f"manifest not found: gs://{bucket_name}/{key} (upload shards/ with examples/shard_vcf_local.py output)")
+        blob.download_to_filename(CFG["MANIFEST"])
+        log(f"manifest from gs://{bucket_name}/{key}")
+    else:
+        if not os.path.isdir(DRIVE_ROOT):
+            sys.exit(f"Drive not mounted: {DRIVE_ROOT}")
+    if not GCS and CFG["SHARDS_URL"] and not os.path.exists(CFG["MANIFEST"]):
         log(f"fetching manifest from {CFG['SHARDS_URL']}")
         sh(f"wget -q -O {CFG['MANIFEST']}.partial {CFG['SHARDS_URL']}/shards.json && mv {CFG['MANIFEST']}.partial {CFG['MANIFEST']}")
-    presharded = bool(CFG["GCS_ROOT"] or CFG["SHARDS_URL"]) or os.path.exists(os.path.join(CFG["SHARDS_DIR"], "shards.json"))
+    presharded = GCS or bool(CFG["SHARDS_URL"]) or os.path.exists(os.path.join(CFG["SHARDS_DIR"], "shards.json"))
     if not presharded and not os.path.exists(CFG["INPUT_BCF"]):
         sys.exit(f"neither pre-cut shards ({CFG['SHARDS_DIR']}/shards.json) nor input ({CFG['INPUT_BCF']}) found")
 
@@ -130,13 +145,13 @@ def main():
     # ---- reference ------------------------------------------------------
     ref, ref_drive = CFG["LOCAL_REF"], CFG["REF_ON_DRIVE"]
     if not os.path.exists(ref + ".fai"):
-        if os.path.exists(ref_drive) and os.path.exists(ref_drive + ".fai"):
+        if not GCS and os.path.exists(ref_drive) and os.path.exists(ref_drive + ".fai"):
             log("copying reference from Drive")
             shutil.copy(ref_drive, ref); shutil.copy(ref_drive + ".fai", ref + ".fai")
         else:
             log("downloading reference from NCBI (~1 GB, 2-3 min)")
             sh(f"wget -q -O - '{CFG['REF_URL']}' | pigz -dc > {ref} && samtools faidx {ref}")
-            if E("CACHE_REF", "0") == "1":
+            if not GCS and E("CACHE_REF", "0") == "1":
                 try:
                     shutil.copy(ref, ref_drive); shutil.copy(ref + ".fai", ref_drive + ".fai")
                     log("cached reference on Drive")
@@ -145,8 +160,8 @@ def main():
 
     # ---- shards ---------------------------------------------------------
     if presharded:
-        # Shards were cut locally (examples/shard_vcf_local.py) and copied to Drive once.
-        # Only the manifest is needed now; each shard is converted to BCF when claimed.
+        # Shards were cut locally (examples/shard_vcf_local.py) and uploaded once.
+        # Only the manifest is needed now; each shard is fetched and converted when claimed.
         if not os.path.exists(CFG["MANIFEST"]):
             shutil.copy(os.path.join(CFG["SHARDS_DIR"], "shards.json"), CFG["MANIFEST"])
         shards = json.load(open(CFG["MANIFEST"]))
@@ -204,7 +219,7 @@ def launch_driver():
     if subprocess.run(["pgrep", "-f", "python[0-9.]* /content/[c]olab_driver.py"], capture_output=True).returncode == 0:
         log("driver already running"); return
     logf = f"{CFG['DRIVE_LOGS']}/driver_{time.strftime('%Y%m%d_%H%M%S')}.log"
-    env = {**os.environ, "COLAB_AUTO_UNASSIGN": AUTO_UNASSIGN}
+    env = {**os.environ, "COLAB_AUTO_UNASSIGN": AUTO_UNASSIGN, "DRIVER_LOG": logf}
     subprocess.Popen(f"nohup python3 /content/colab_driver.py > {logf} 2>&1 &", shell=True, env=env)
     log(f"driver launched; log: {logf}")
 
