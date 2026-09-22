@@ -11,6 +11,7 @@
 #   examples/colab_master.sh status                # tail each session's driver log
 #   examples/colab_master.sh watch                 # poll; `colab stop` each session once its driver exits
 #   examples/colab_master.sh stop                  # stop every session now
+#   examples/colab_master.sh sessions              # list the sessions this script knows about
 #
 # Everything the on-VM step does lives in examples/colab_run.py; this script only moves it
 # there and runs it. Per-run settings are environment variables passed through to it:
@@ -25,7 +26,15 @@ REPO_URL=${REPO_URL:-https://github.com/chundruv/SpliceAImod.git}
 REPO_BRANCH=${REPO_BRANCH:-}
 PASS_VARS="DRIVE_ROOT INPUT_BCF REF_ON_DRIVE ANNOTATION DISTANCE VARIANTS_PER_SHARD PRED_BATCH TORCH_BATCH BATCH_WORKERS PRECISION EXTRA_FLAGS REPO_BRANCH"
 
-sessions() { colab ls-sessions 2>/dev/null | grep -o "${PREFIX}-[0-9]*" | sort -u || true; }
+# Sessions this script launched are recorded locally (one name per line); the CLI's own
+# session listing is not relied on. Override with SESSIONS="spliceai-1 spliceai-2" if needed.
+SESSIONS_FILE=${SESSIONS_FILE:-$HOME/.spliceai_colab_sessions}
+sessions() {
+  if [ -n "${SESSIONS:-}" ]; then echo "$SESSIONS" | tr ' ' '\n'; return; fi
+  [ -f "$SESSIONS_FILE" ] && sort -u "$SESSIONS_FILE" || true
+}
+remember() { grep -qx "$1" "$SESSIONS_FILE" 2>/dev/null || echo "$1" >> "$SESSIONS_FILE"; }
+forget()   { [ -f "$SESSIONS_FILE" ] && grep -vx "$1" "$SESSIONS_FILE" > "$SESSIONS_FILE.tmp" && mv "$SESSIONS_FILE.tmp" "$SESSIONS_FILE" || true; }
 
 # python snippet run on the VM via `colab exec` (stdin): clone repo, export settings, run colab_run.py
 bootstrap_py() {
@@ -42,7 +51,8 @@ if not os.path.isdir("/content/SpliceAImod"):
     subprocess.run(["git", "clone", "-q", "${REPO_URL}", "/content/SpliceAImod"], check=True)
     if "${REPO_BRANCH}":
         subprocess.run(["git", "-C", "/content/SpliceAImod", "checkout", "-q", "${REPO_BRANCH}"], check=True)
-runpy.run_path("/content/SpliceAImod/examples/colab_run.py", run_name="__main__")
+_ = runpy.run_path("/content/SpliceAImod/examples/colab_run.py", run_name="__main__")
+del _
 PY
 }
 
@@ -68,6 +78,7 @@ case "$cmd" in
       S="${PREFIX}-${i}"
       echo "== $S: provisioning $GPU"
       colab new -s "$S" --gpu "$GPU"
+      remember "$S"
       colab drivemount -s "$S"
       sleep 5
       echo "== $S: bootstrapping (install, reference, shards) and launching driver"
@@ -77,12 +88,15 @@ case "$cmd" in
     ;;
   bootstrap)
     S=${2:?session name}
+    remember "$S"
     echo "== $S: bootstrapping (install, reference, shards) and launching driver"
     bootstrap_py | exec_retry "$S"
     ;;
   status)
     for S in $(sessions); do
-      echo "===== $S"; echo "$driver_alive_py" | colab exec -s "$S"; echo "$tail_py" | colab exec -s "$S"
+      echo "===== $S"
+      echo "$driver_alive_py" | colab exec -s "$S" 2>/dev/null || { echo "(session unreachable — released or never bootstrapped)"; continue; }
+      echo "$tail_py" | colab exec -s "$S" 2>/dev/null || true
     done
     ;;
   watch)
@@ -93,14 +107,17 @@ case "$cmd" in
       for S in $(sessions); do
         st=$(echo "$driver_alive_py" | colab exec -s "$S" 2>/dev/null | tail -1 || echo GONE)
         echo "$(date +%H:%M) $S $st"
-        if [ "$st" = "DEAD" ]; then colab stop -s "$S" || true; else live=$((live+1)); fi
+        if [ "$st" = "DEAD" ] || [ "$st" = "GONE" ]; then colab stop -s "$S" || true; forget "$S"; else live=$((live+1)); fi
       done
       [ "$live" -eq 0 ] && { echo "all sessions finished"; break; }
       sleep 600
     done
     ;;
   stop)
-    for S in $(sessions); do colab stop -s "$S" || true; done
+    for S in $(sessions); do colab stop -s "$S" || true; forget "$S"; done
+    ;;
+  sessions)
+    sessions
     ;;
   *) echo "unknown command $cmd"; exit 2;;
 esac
