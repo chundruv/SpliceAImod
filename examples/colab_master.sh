@@ -60,10 +60,14 @@ PY
 
 # `colab exec` occasionally reports "Connection was lost." right after a drivemount or a long
 # idle; the kernel is fine and a fresh command reconnects. Retry a few times before giving up.
-exec_retry() {  # exec_retry SESSION  (code on stdin)
-  local S=$1 code; code=$(cat)
+# `colab exec --timeout` is an OUTPUT-IDLE timeout (default 30 s, undocumented): the CLI gives up
+# if the kernel prints nothing for that long, even though the code keeps running on the VM. The
+# bootstrap has silent stretches (pip resolving, the reference copy), so it gets a long one.
+EXEC_TIMEOUT=${EXEC_TIMEOUT:-1800}
+exec_retry() {  # exec_retry SESSION [TIMEOUT]  (code on stdin)
+  local S=$1 T=${2:-$EXEC_TIMEOUT} code; code=$(cat)
   for attempt in 1 2 3 4; do
-    if printf '%s' "$code" | colab exec -s "$S"; then return 0; fi
+    if printf '%s' "$code" | colab exec -s "$S" --timeout "$T"; then return 0; fi
     echo "== $S: exec failed (attempt $attempt), retrying in 15s"; sleep 15
   done
   return 1
@@ -101,8 +105,8 @@ case "$cmd" in
   status)
     for S in $(sessions); do
       echo "===== $S"
-      echo "$driver_alive_py" | colab exec -s "$S" 2>/dev/null || { echo "(session unreachable — released or never bootstrapped)"; continue; }
-      echo "$tail_py" | colab exec -s "$S" 2>/dev/null || true
+      echo "$driver_alive_py" | colab exec -s "$S" --timeout 120 2>/dev/null || { echo "(session unreachable — released or never bootstrapped)"; continue; }
+      echo "$tail_py" | colab exec -s "$S" --timeout 120 2>/dev/null || true
     done
     ;;
   watch)
@@ -111,7 +115,7 @@ case "$cmd" in
     while :; do
       live=0
       for S in $(sessions); do
-        st=$(echo "$driver_alive_py" | colab exec -s "$S" 2>/dev/null | tail -1 || echo GONE)
+        st=$(echo "$driver_alive_py" | colab exec -s "$S" --timeout 120 2>/dev/null | tail -1 || echo GONE)
         echo "$(date +%H:%M) $S $st"
         if [ "$st" = "DEAD" ] || [ "$st" = "GONE" ]; then colab stop -s "$S" || true; forget "$S"; else live=$((live+1)); fi
       done
@@ -128,7 +132,7 @@ case "$cmd" in
   diag)
     # what is actually running on the VM: driver/spliceai processes, GPU, claims, GPU-worker log tail
     S=${2:?session name}
-    cat <<'PY' | colab exec -s "$S"
+    cat <<'PY' | colab exec -s "$S" --timeout 120
 import subprocess, glob
 cmd = r'''
 echo "--- processes"; ps -eo pid,etime,pcpu,cmd | grep -E "colab_driver|spliceai|batch\.py" | grep -v grep

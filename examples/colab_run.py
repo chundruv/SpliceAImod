@@ -94,13 +94,13 @@ def main():
 
     # ---- install --------------------------------------------------------
     if INSTALL or not shutil.which("spliceai"):
-        sh("apt-get -qq update && apt-get install -y bcftools samtools pigz 2>&1 | tail -n 3")
-        sh("pip install pysam pyfaidx pandas numpy intervaltree numba h5py psutil nvidia-ml-py 2>&1 | tail -n 5")
+        sh("apt-get -qq update && apt-get install -y --no-install-recommends bcftools samtools pigz")
+        sh("pip install --progress-bar off pysam pyfaidx pandas numpy intervaltree numba h5py psutil nvidia-ml-py")
         if not os.path.isdir(REPO_DIR):
             sh(f"git clone -q {CFG['REPO_URL']} {REPO_DIR}")
             if E("REPO_BRANCH"):
                 sh(f"cd {REPO_DIR} && git checkout -q {E('REPO_BRANCH')}")
-        sh(f"cd {REPO_DIR} && pip install -e . 2>&1 | tail -n 5")
+        sh(f"cd {REPO_DIR} && pip install --progress-bar off -e .")
     import torch
     log(f"torch {torch.__version__} | {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU'}")
 
