@@ -25,6 +25,17 @@ defaults as the notebook's cell 1:
   SHARDS_DIR            $DRIVE_ROOT/shards   pre-cut shards + shards.json from
                                              examples/shard_vcf_local.py. If present, the input
                                              is never scanned or region-cut on the VM (preferred).
+  SHARDS_URL            (none)  HTTPS base URL serving shards.json and shard_*.vcf.gz, e.g. a
+                                GitHub release: https://github.com/<user>/<repo>/releases/download/<tag>
+                                Used instead of SHARDS_DIR, so Drive holds no shards at all.
+  GCS_ROOT              (none)  gs://bucket/prefix. Shards are read from $GCS_ROOT/shards/ and
+                                results written to $GCS_ROOT/out/; Drive then holds only the
+                                claims / .done markers / manifest / logs. Auth: in a browser
+                                notebook run `from google.colab import auth; auth.authenticate_user()`
+                                first; headless, put a service-account key on Drive and set
+                                GCS_KEY_FILE to its path (roles/storage.objectAdmin on the bucket).
+  GCS_KEY_FILE          (none)  service-account JSON for gsutil (see GCS_ROOT)
+  CACHE_REF             0/1  copy a freshly downloaded reference back to Drive (default 0)
   REPO_DIR              /content/SpliceAImod  (must already be cloned + pip installed, or
                                                set INSTALL=1 to do it here)
   INSTALL               0/1  run apt/pip installs
@@ -41,6 +52,8 @@ CFG = dict(
     DRIVE_ROOT=DRIVE_ROOT,
     INPUT_BCF=E("INPUT_BCF", f"{DRIVE_ROOT}/input/variants.bcf"),
     SHARDS_DIR=E("SHARDS_DIR", f"{DRIVE_ROOT}/shards"),
+    SHARDS_URL=E("SHARDS_URL", "").rstrip("/"),
+    GCS_ROOT=E("GCS_ROOT", "").rstrip("/"),
     REF_ON_DRIVE=E("REF_ON_DRIVE", f"{DRIVE_ROOT}/ref/GRCh38.fa"),
     REF_URL=E("REF_URL", "https://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/GCA_000001405.15_GRCh38/"
                          "seqs_for_alignment_pipelines.ucsc_ids/GCA_000001405.15_GRCh38_no_alt_analysis_set.fna.gz"),
@@ -86,9 +99,19 @@ def main():
     json.dump(CFG, open("/content/run_config.json", "w"), indent=1)
     log("config written to /content/run_config.json")
 
-    presharded = os.path.exists(os.path.join(CFG["SHARDS_DIR"], "shards.json"))
     if not os.path.isdir(DRIVE_ROOT):
         sys.exit(f"Drive not mounted: {DRIVE_ROOT}")
+    if CFG["GCS_ROOT"]:
+        if E("GCS_KEY_FILE"):
+            sh(f"gcloud -q auth activate-service-account --key-file {E('GCS_KEY_FILE')}")
+        # fail early and clearly if the bucket is not reachable
+        sh(f"gsutil -q ls {CFG['GCS_ROOT']}/shards/shards.json")
+        if not os.path.exists(CFG["MANIFEST"]):
+            sh(f"gsutil -q cp {CFG['GCS_ROOT']}/shards/shards.json {CFG['MANIFEST']}")
+    elif CFG["SHARDS_URL"] and not os.path.exists(CFG["MANIFEST"]):
+        log(f"fetching manifest from {CFG['SHARDS_URL']}")
+        sh(f"wget -q -O {CFG['MANIFEST']}.partial {CFG['SHARDS_URL']}/shards.json && mv {CFG['MANIFEST']}.partial {CFG['MANIFEST']}")
+    presharded = bool(CFG["GCS_ROOT"] or CFG["SHARDS_URL"]) or os.path.exists(os.path.join(CFG["SHARDS_DIR"], "shards.json"))
     if not presharded and not os.path.exists(CFG["INPUT_BCF"]):
         sys.exit(f"neither pre-cut shards ({CFG['SHARDS_DIR']}/shards.json) nor input ({CFG['INPUT_BCF']}) found")
 
@@ -111,18 +134,23 @@ def main():
             log("copying reference from Drive")
             shutil.copy(ref_drive, ref); shutil.copy(ref_drive + ".fai", ref + ".fai")
         else:
-            log("downloading reference from NCBI")
+            log("downloading reference from NCBI (~1 GB, 2-3 min)")
             sh(f"wget -q -O - '{CFG['REF_URL']}' | pigz -dc > {ref} && samtools faidx {ref}")
-            shutil.copy(ref, ref_drive); shutil.copy(ref + ".fai", ref_drive + ".fai")
+            if E("CACHE_REF", "0") == "1":
+                try:
+                    shutil.copy(ref, ref_drive); shutil.copy(ref + ".fai", ref_drive + ".fai")
+                    log("cached reference on Drive")
+                except OSError as e:
+                    log(f"could not cache reference on Drive ({e}); continuing")
 
     # ---- shards ---------------------------------------------------------
     if presharded:
         # Shards were cut locally (examples/shard_vcf_local.py) and copied to Drive once.
         # Only the manifest is needed now; each shard is converted to BCF when claimed.
-        shards = json.load(open(os.path.join(CFG["SHARDS_DIR"], "shards.json")))
         if not os.path.exists(CFG["MANIFEST"]):
             shutil.copy(os.path.join(CFG["SHARDS_DIR"], "shards.json"), CFG["MANIFEST"])
-        log(f"pre-cut shards: {len(shards)} in {CFG['SHARDS_DIR']}")
+        shards = json.load(open(CFG["MANIFEST"]))
+        log(f"pre-cut shards: {len(shards)} from {CFG['GCS_ROOT'] or CFG['SHARDS_URL'] or CFG['SHARDS_DIR']}")
         return launch_driver()
 
     inp = CFG["INPUT_BCF"]
@@ -158,7 +186,8 @@ def main():
         json.dump(shards, open(tmp, "w"), indent=1); os.replace(tmp, CFG["MANIFEST"])
         log(f"manifest written: {len(shards)} shards")
 
-    todo = [s for s in shards if not os.path.exists(f"{CFG['DRIVE_OUT']}/{s['id']}.tsv.gz")]
+    todo = [s for s in shards if not (os.path.exists(f"{CFG['DRIVE_OUT']}/{s['id']}.done")
+                                       or os.path.exists(f"{CFG['DRIVE_OUT']}/{s['id']}.tsv.gz"))]
     log(f"{len(todo)} shards not yet finished")
     for s in todo:
         bcf = f"{CFG['LOCAL_SHARDS']}/{s['id']}.bcf"

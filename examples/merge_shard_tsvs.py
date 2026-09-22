@@ -4,6 +4,8 @@ gzip TSV with a single header block, in manifest order. Pure streaming; no depen
 
 Usage:  python examples/merge_shard_tsvs.py <out_dir_with_shard_*.tsv.gz> <merged.tsv.gz> [shards.json]
 
+Results in a bucket: first  gsutil -m cp "gs://my-bucket/spliceai_run/out/shard_*.tsv.gz" out/
+
 If shards.json is given, files are taken in manifest order and any missing shard aborts the
 merge; otherwise shard_*.tsv.gz are taken in name order.
 """

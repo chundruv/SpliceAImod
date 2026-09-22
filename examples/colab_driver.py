@@ -39,15 +39,26 @@ def fetch_shard(s):
     bcf = f"{C['LOCAL_SHARDS']}/{sid}.bcf"
     if os.path.exists(bcf + ".csi"):
         return bcf
-    src = os.path.join(C.get("SHARDS_DIR", ""), s.get("file", ""))
-    if s.get("file") and os.path.exists(src):
-        os.makedirs(C["LOCAL_SHARDS"], exist_ok=True)
-        local_vcf = f"{C['LOCAL_SHARDS']}/{s['file']}"
+    if not s.get("file"):
+        return None
+    os.makedirs(C["LOCAL_SHARDS"], exist_ok=True)
+    local_vcf = f"{C['LOCAL_SHARDS']}/{s['file']}"
+    url = C.get("SHARDS_URL", "")
+    gcs = C.get("GCS_ROOT", "")
+    src = os.path.join(C.get("SHARDS_DIR", ""), s["file"])
+    if gcs:
+        if subprocess.run(f"gsutil -q cp {gcs}/shards/{s['file']} {local_vcf}", shell=True).returncode != 0:
+            log(f"{sid}: gsutil cp failed: {gcs}/shards/{s['file']}"); return None
+    elif url:
+        if subprocess.run(f"wget -q -O {local_vcf} {url}/{s['file']}", shell=True).returncode != 0:
+            log(f"{sid}: download failed: {url}/{s['file']}"); return None
+    elif os.path.exists(src):
         shutil.copy(src, local_vcf)
-        rc = subprocess.run(f"bcftools view -Ob -o {bcf} {local_vcf} && bcftools index {bcf}", shell=True).returncode
-        os.remove(local_vcf)
-        return bcf if rc == 0 else None
-    return None
+    else:
+        return None
+    rc = subprocess.run(f"bcftools view -Ob -o {bcf} {local_vcf} && bcftools index {bcf}", shell=True).returncode
+    os.remove(local_vcf)
+    return bcf if rc == 0 else None
 
 
 def run_shard(s):
@@ -67,9 +78,22 @@ def run_shard(s):
     rc = subprocess.run(cmd, env=env).returncode
     if rc != 0 or not os.path.exists(out):
         log(f"{sid}: FAILED rc={rc}"); return False
-    final = f"{DRIVE_OUT}/{sid}.tsv.gz"
-    shutil.move(out, final + ".partial")
-    os.replace(final + ".partial", final)
+    gcs = C.get("GCS_ROOT", "")
+    if gcs:
+        # Result goes to the bucket (GCS uploads are atomic per object); only the marker lands on Drive.
+        dest = f"{gcs}/out/{sid}.tsv.gz"
+        if subprocess.run(f"gsutil -q cp {out} {dest}", shell=True).returncode != 0:
+            log(f"{sid}: gsutil upload FAILED, result kept at {out}"); return False
+        size = os.path.getsize(out); os.remove(out); final = dest
+    else:
+        final = f"{DRIVE_OUT}/{sid}.tsv.gz"
+        shutil.move(out, final + ".partial")
+        os.replace(final + ".partial", final)
+        size = os.path.getsize(final)
+    # Tiny completion marker, separate from the result file, so the result can live anywhere
+    # (bucket, or moved off Drive by drain_drive.sh) without the shard being re-run.
+    with open(f"{DRIVE_OUT}/{sid}.done", "w") as f:
+        f.write(f"{SESSION} {time.strftime('%Y-%m-%dT%H:%M:%S')} {size} {final}\n")
     log(f"{sid}: done in {(time.time()-t0)/3600:.2f} h -> {final}")
     shutil.rmtree(C["LOCAL_TMP"], ignore_errors=True); os.makedirs(C["LOCAL_TMP"], exist_ok=True)
     return True
@@ -95,10 +119,14 @@ def merge(shards):
     shutil.move(tmp, final + ".partial"); os.replace(final + ".partial", final)
     log(f"merged -> {final}")
 
+def finished(s):
+    return (os.path.exists(f"{DRIVE_OUT}/{s['id']}.done")
+            or os.path.exists(f"{DRIVE_OUT}/{s['id']}.tsv.gz"))
+
 shards = json.load(open(C["MANIFEST"]))
 log(f"session {SESSION}")
 while True:
-    todo = [s for s in shards if not os.path.exists(f"{DRIVE_OUT}/{s['id']}.tsv.gz")]
+    todo = [s for s in shards if not finished(s)]
     if not todo:
         log("all shards finished — merge locally with examples/merge_shard_tsvs.py "
             "(or set MERGE_ON_VM=1 to merge here)")
