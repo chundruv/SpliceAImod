@@ -7,6 +7,7 @@
 #
 # Usage:
 #   examples/colab_master.sh launch [N] [GPU]      # default N=1, GPU=A100
+#   examples/colab_master.sh add [N] [GPU]         # same, later: adds N more sessions to a running job
 #   examples/colab_master.sh bootstrap SESSION     # (re)run setup+launch on an existing session
 #   examples/colab_master.sh status                # tail each session's driver log
 #   examples/colab_master.sh watch                 # poll; `colab stop` each session once its driver exits
@@ -73,9 +74,13 @@ tail_py='import glob;l=sorted(glob.glob("/content/drive/MyDrive/spliceai_run/log
 
 cmd=${1:-launch}
 case "$cmd" in
-  launch)
+  launch|add)
+    # Session names continue from the highest index already recorded, so `add 2` after
+    # `launch 1` gives spliceai-2 and spliceai-3 and never collides with a running session.
     N=${2:-1}; GPU=${3:-A100}
-    for i in $(seq 1 "$N"); do
+    last=$(sessions | sed -n "s/^${PREFIX}-\([0-9]*\)$/\1/p" | sort -n | tail -1)
+    start=$(( ${last:-0} + 1 ))
+    for i in $(seq "$start" $(( start + N - 1 ))); do
       S="${PREFIX}-${i}"
       echo "== $S: provisioning $GPU"
       colab new -s "$S" --gpu "$GPU"
