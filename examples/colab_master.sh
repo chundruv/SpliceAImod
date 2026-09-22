@@ -7,6 +7,7 @@
 #
 # Usage:
 #   examples/colab_master.sh launch [N] [GPU]      # default N=1, GPU=A100
+#   examples/colab_master.sh bootstrap SESSION     # (re)run setup+launch on an existing session
 #   examples/colab_master.sh status                # tail each session's driver log
 #   examples/colab_master.sh watch                 # poll; `colab stop` each session once its driver exits
 #   examples/colab_master.sh stop                  # stop every session now
@@ -45,6 +46,17 @@ runpy.run_path("/content/SpliceAImod/examples/colab_run.py", run_name="__main__"
 PY
 }
 
+# `colab exec` occasionally reports "Connection was lost." right after a drivemount or a long
+# idle; the kernel is fine and a fresh command reconnects. Retry a few times before giving up.
+exec_retry() {  # exec_retry SESSION  (code on stdin)
+  local S=$1 code; code=$(cat)
+  for attempt in 1 2 3 4; do
+    if printf '%s' "$code" | colab exec -s "$S"; then return 0; fi
+    echo "== $S: exec failed (attempt $attempt), retrying in 15s"; sleep 15
+  done
+  return 1
+}
+
 driver_alive_py='import subprocess;print("ALIVE" if subprocess.run(["pgrep","-f","python /content/[c]olab_driver.py"],capture_output=True).returncode==0 else "DEAD")'
 tail_py='import glob;l=sorted(glob.glob("/content/drive/MyDrive/spliceai_run/logs/driver_*.log"));print(open(l[-1]).read()[-1500:] if l else "no log")'
 
@@ -57,10 +69,16 @@ case "$cmd" in
       echo "== $S: provisioning $GPU"
       colab new -s "$S" --gpu "$GPU"
       colab drivemount -s "$S"
+      sleep 5
       echo "== $S: bootstrapping (install, reference, shards) and launching driver"
-      bootstrap_py | colab exec -s "$S"
+      bootstrap_py | exec_retry "$S"
     done
     echo "launched $N session(s). Run: $0 status | $0 watch"
+    ;;
+  bootstrap)
+    S=${2:?session name}
+    echo "== $S: bootstrapping (install, reference, shards) and launching driver"
+    bootstrap_py | exec_retry "$S"
     ;;
   status)
     for S in $(sessions); do
