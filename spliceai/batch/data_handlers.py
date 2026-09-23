@@ -5,6 +5,7 @@
 import logging
 import pysam
 import collections
+import io
 import os
 import numpy as np
 import pickle
@@ -349,10 +350,10 @@ class VCFWriter:
         self.vcf_out.close()
 
     def process_tsv(self):
-        import gzip
         self.vcf_in = pysam.VariantFile(self.input_data)
+        self._pigz_proc = None
         if isinstance(self.output_data, str):
-            self.tsv_out = gzip.open(self.output_data, 'wt')
+            self.tsv_out = self._open_compressed_output(self.output_data)
         else:
             self.tsv_out = self.output_data
 
@@ -362,6 +363,27 @@ class VCFWriter:
         self._write_tsv_records()
         self.vcf_in.close()
         self.tsv_out.close()
+        if self._pigz_proc is not None:
+            self._pigz_proc.wait()
+
+    def _open_compressed_output(self, path):
+        """Prefer pigz (parallel gzip) over the single-threaded gzip module, which
+        was the writer's actual bottleneck -- falls back to gzip if unavailable."""
+        import shutil
+        pigz_path = shutil.which('pigz')
+        if pigz_path:
+            import subprocess
+            f_out = open(path, 'wb')
+            self._pigz_proc = subprocess.Popen(
+                [pigz_path, '-p', str(self.num_write_threads), '-4', '-c'],
+                stdin=subprocess.PIPE, stdout=f_out
+            )
+            f_out.close()
+            return io.TextIOWrapper(self._pigz_proc.stdin, encoding='utf-8')
+
+        logger.warning("pigz not found on PATH, falling back to single-threaded gzip")
+        import gzip
+        return gzip.open(path, 'wt', compresslevel=4)
 
     def _validate_prediction_files(self):
             """Validate that all expected prediction files exist"""
@@ -689,13 +711,18 @@ class VCFWriter:
                         logger.error(f"Error at record {idx}: {e}")
                         results[idx] = []
 
+        lines = []
         for idx, record, _ in work_items:
             scores = results.get(idx, [])
             alt_str = ','.join(record.alts) if record.alts else '.'
             for score_str in scores:
                 score_fields = score_str.split('|')
                 row_fields = [record.chrom, str(record.pos), record.ref, alt_str] + score_fields
-                self.tsv_out.write('\t'.join(row_fields) + '\n')
+                lines.append('\t'.join(row_fields))
+        # One write() per batch instead of per score line -- each write() triggers
+        # gzip compression, so batching drastically cuts compression call overhead.
+        if lines:
+            self.tsv_out.write('\n'.join(lines) + '\n')
 
     def _process_record_batch_orig(self, work_items, results, get_batch_func):
         """Batched processing for orig output - vectorized numpy operations"""
