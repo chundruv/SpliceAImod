@@ -23,6 +23,7 @@ C = json.load(open("/content/run_config.json"))
 STALE_MIN = 30
 SESSION = f"{socket.gethostname()}-{os.getpid()}-{int(time.time())}"
 LOG_PATH = os.environ.get("DRIVER_LOG", "")          # local log file (mirrored to the store)
+OUT_EXT = ".vcf.gz" if C.get("VCF_OUTPUT") else ".tsv.gz"
 
 
 def log(msg):
@@ -40,7 +41,7 @@ class DriveStore:
         os.makedirs(self.out, exist_ok=True)
 
     def finished(self, sid):
-        return os.path.exists(f"{self.out}/{sid}.done") or os.path.exists(f"{self.out}/{sid}.tsv.gz")
+        return os.path.exists(f"{self.out}/{sid}.done") or os.path.exists(f"{self.out}/{sid}{OUT_EXT}")
 
     def try_claim(self, sid):
         p = f"{self.out}/{sid}.claim"
@@ -75,7 +76,7 @@ class DriveStore:
         return False
 
     def put_result(self, sid, local_path):
-        final = f"{self.out}/{sid}.tsv.gz"
+        final = f"{self.out}/{sid}{OUT_EXT}"
         shutil.move(local_path, final + ".partial"); os.replace(final + ".partial", final)
         return final
 
@@ -104,7 +105,7 @@ class GCSStore:
         return self.bucket.blob(self._p(*parts))
 
     def finished(self, sid):
-        return self._blob("state", f"{sid}.done").exists() or self._blob("out", f"{sid}.tsv.gz").exists()
+        return self._blob("state", f"{sid}.done").exists() or self._blob("out", f"{sid}{OUT_EXT}").exists()
 
     def try_claim(self, sid):
         from google.api_core.exceptions import PreconditionFailed
@@ -136,7 +137,7 @@ class GCSStore:
         b.download_to_filename(local_vcf); return True
 
     def put_result(self, sid, local_path):
-        b = self._blob("out", f"{sid}.tsv.gz")
+        b = self._blob("out", f"{sid}{OUT_EXT}")
         b.upload_from_filename(local_path, timeout=600)       # single-object upload: atomic
         os.remove(local_path)
         return f"gs://{self.bucket_name}/{b.name}"
@@ -172,12 +173,17 @@ def run_shard(s):
         os.remove(local_vcf)
         if rc != 0:
             log(f"{sid}: bcftools conversion failed"); return False
-    out = f"{C['LOCAL_OUT']}/{sid}.tsv.gz"
+    out = f"{C['LOCAL_OUT']}/{sid}{OUT_EXT}"
     for stale in glob.glob(f"{C['LOCAL_OUT']}/{sid}*"): os.remove(stale)
     cmd = ["spliceai", "-I", bcf, "-O", out, "-R", C["LOCAL_REF"], "-A", C["ANNOTATION"],
            "-D", str(C["DISTANCE"]), "-G", "all", "--precision", C["PRECISION"],
            "-B", str(C["PRED_BATCH"]), "-T", str(C["TORCH_BATCH"]),
-           "--batch-workers", str(C["BATCH_WORKERS"]), "-t", C["LOCAL_TMP"], "-V"] + C["EXTRA_FLAGS"].split()
+           "--batch-workers", str(C["BATCH_WORKERS"]), "-t", C["LOCAL_TMP"], "-V"]
+    if C.get("ORIG_OUTPUT"):
+        cmd.append("--orig-output")
+    if C.get("VCF_OUTPUT"):
+        cmd.append("--vcf-output")
+    cmd += C["EXTRA_FLAGS"].split()
     env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
     log(f"{sid}: start ({s['chrom']}:{s['start']}-{s['end']}, {s.get('n', '?')} records)")
     t0 = time.time()

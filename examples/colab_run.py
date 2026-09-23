@@ -21,6 +21,8 @@ defaults as the notebook's cell 1:
   TORCH_BATCH           256
   BATCH_WORKERS         4
   PRECISION             fp16
+  ORIG_OUTPUT           0/1  emit only the original SpliceAI columns (default 0)
+  VCF_OUTPUT            0/1  write annotated VCF instead of TSV (default 0)
   EXTRA_FLAGS           "--compile --conv-impl valid_nhwc"
   SHARDS_DIR            $DRIVE_ROOT/shards   pre-cut shards + shards.json from
                                              examples/shard_vcf_local.py. If present, the input
@@ -68,6 +70,8 @@ CFG = dict(
     TORCH_BATCH=int(E("TORCH_BATCH", "256")),
     BATCH_WORKERS=int(E("BATCH_WORKERS", "4")),
     PRECISION=E("PRECISION", "fp16"),
+    ORIG_OUTPUT=E("ORIG_OUTPUT", "0") == "1",
+    VCF_OUTPUT=E("VCF_OUTPUT", "0") == "1",
     EXTRA_FLAGS=E("EXTRA_FLAGS", "--compile --conv-impl valid_nhwc"),
     LOCAL=E("LOCAL", "/content/work"),
 )
