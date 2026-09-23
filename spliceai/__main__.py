@@ -374,25 +374,45 @@ def run_spliceai_batched(args, ann, devices, device_info):
         reader.start()
         logging.info("Batch reader started")
 
-        # Phase 2: Start GPU workers for inference
-        worker_clients, worker_servers, devices = start_workers(prediction_queue, tmpdir, args, devices, device_info, workers_per_gpu)
-        logging.info(f"Started {len(worker_clients)} GPU workers")
+        # Optional GPU-phase lock (SPLICEAI_GPU_LOCK=<path>): several spliceai processes on
+        # one GPU take turns in the inference phase, so one process's CPU-only phases (batch
+        # preparation before, output writing after) overlap another's GPU phase. The batch
+        # reader above is already running while we wait, bounded by the on-disk queue.
+        gpu_lock = None
+        lock_path = os.environ.get('SPLICEAI_GPU_LOCK')
+        if lock_path:
+            import fcntl
+            gpu_lock = open(lock_path, 'w')
+            lock_wait = time.time()
+            logging.info(f"Waiting for GPU lock {lock_path}")
+            fcntl.flock(gpu_lock, fcntl.LOCK_EX)
+            logging.info(f"GPU lock acquired after {time.time() - lock_wait:.0f}s")
+        try:
+            # Phase 2: Start GPU workers for inference
+            worker_clients, worker_servers, devices = start_workers(prediction_queue, tmpdir, args, devices, device_info, workers_per_gpu)
+            logging.info(f"Started {len(worker_clients)} GPU workers")
 
-        # Wait for reader to finish (batches are prepared)
-        logging.debug("Waiting for VCF reader to join")
-        reader.join()
-        logging.debug("Reader joined!")
-    
-        # Wait for GPU workers to finish (predictions are done)
-        logging.debug("Waiting for workers to join")
-        for p in worker_clients:
-            p.wait()
-        logging.debug("Workers are done!")
-    
-        logging.debug("Waiting for servers to join")
-        for p in worker_servers:
-            p.join()
-        logging.debug("Servers are done")
+            # Wait for reader to finish (batches are prepared)
+            logging.debug("Waiting for VCF reader to join")
+            reader.join()
+            logging.debug("Reader joined!")
+
+            # Wait for GPU workers to finish (predictions are done)
+            logging.debug("Waiting for workers to join")
+            for p in worker_clients:
+                p.wait()
+            logging.debug("Workers are done!")
+
+            logging.debug("Waiting for servers to join")
+            for p in worker_servers:
+                p.join()
+            logging.debug("Servers are done")
+        finally:
+            if gpu_lock is not None:
+                import fcntl
+                fcntl.flock(gpu_lock, fcntl.LOCK_UN)
+                gpu_lock.close()
+                logging.info("GPU lock released")
 
         prediction_duration = time.time() - start_time
         logging.info(f"GPU inference complete in {prediction_duration:.1f}s")

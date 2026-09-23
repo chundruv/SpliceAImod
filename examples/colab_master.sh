@@ -28,7 +28,7 @@ set -euo pipefail
 PREFIX=${SESSION_PREFIX:-spliceai}
 REPO_URL=${REPO_URL:-https://github.com/chundruv/SpliceAImod.git}
 REPO_BRANCH=${REPO_BRANCH:-}
-PASS_VARS="DRIVE_ROOT INPUT_BCF SHARDS_DIR SHARDS_URL GCS_ROOT GCS_KEY_FILE CACHE_REF REF_ON_DRIVE ANNOTATION DISTANCE VARIANTS_PER_SHARD PRED_BATCH TORCH_BATCH BATCH_WORKERS PRECISION EXTRA_FLAGS REPO_BRANCH"
+PASS_VARS="DRIVE_ROOT INPUT_BCF SHARDS_DIR SHARDS_URL GCS_ROOT GCS_KEY_FILE CACHE_REF REF_ON_DRIVE ANNOTATION DISTANCE VARIANTS_PER_SHARD PRED_BATCH TORCH_BATCH BATCH_WORKERS PRECISION EXTRA_FLAGS REPO_BRANCH PIPELINE ORIG_OUTPUT VCF_OUTPUT"
 
 # Sessions this script launched are recorded locally (one name per line); the CLI's own
 # session listing is not relied on. Override with SESSIONS="spliceai-1 spliceai-2" if needed.
@@ -139,7 +139,7 @@ cmd = r'''
 echo "--- processes"; ps -eo pid,etime,pcpu,cmd | grep -E "colab_driver|spliceai|batch\.py" | grep -v grep
 echo "--- gpu"; nvidia-smi --query-gpu=utilization.gpu,memory.used --format=csv,noheader
 echo "--- driver log tail"; tail -n 8 $(ls -t /content/work/logs/driver_*.log /content/drive/MyDrive/spliceai_run/logs/driver_*.log 2>/dev/null | head -1)
-echo "--- gpu worker stderr tail"; tail -n 12 /content/work/tmp/*/GPU_0_w0.stderr 2>/dev/null || echo none
+echo "--- gpu worker stderr tail"; tail -n 12 /content/work/tmp/*/*/GPU_0_w0.stderr 2>/dev/null || echo none
 '''
 print(subprocess.run(cmd, shell=True, capture_output=True, text=True).stdout)
 PY

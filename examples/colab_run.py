@@ -19,10 +19,12 @@ defaults as the notebook's cell 1:
   VARIANTS_PER_SHARD    1500000
   PRED_BATCH            8192
   TORCH_BATCH           256
-  BATCH_WORKERS         4
+  BATCH_WORKERS         3
   PRECISION             fp16
   ORIG_OUTPUT           0/1  emit only the original SpliceAI columns (default 0)
   VCF_OUTPUT            0/1  write annotated VCF instead of TSV (default 0)
+  PIPELINE              2    shards in flight per GPU (one in its GPU phase, the others
+                             preparing batches / writing output); 1 = strictly sequential
   EXTRA_FLAGS           "--compile --conv-impl valid_nhwc"
   SHARDS_DIR            $DRIVE_ROOT/shards   pre-cut shards + shards.json from
                                              examples/shard_vcf_local.py. If present, the input
@@ -68,10 +70,11 @@ CFG = dict(
     VARIANTS_PER_SHARD=int(E("VARIANTS_PER_SHARD", "1500000")),
     PRED_BATCH=int(E("PRED_BATCH", "8192")),
     TORCH_BATCH=int(E("TORCH_BATCH", "256")),
-    BATCH_WORKERS=int(E("BATCH_WORKERS", "4")),
+    BATCH_WORKERS=int(E("BATCH_WORKERS", "3")),
     PRECISION=E("PRECISION", "fp16"),
     ORIG_OUTPUT=E("ORIG_OUTPUT", "0") == "1",
     VCF_OUTPUT=E("VCF_OUTPUT", "0") == "1",
+    PIPELINE=int(E("PIPELINE", "2")),
     EXTRA_FLAGS=E("EXTRA_FLAGS", "--compile --conv-impl valid_nhwc"),
     LOCAL=E("LOCAL", "/content/work"),
 )

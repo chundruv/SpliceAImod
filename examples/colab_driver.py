@@ -1,8 +1,13 @@
 """SpliceAImod shard driver.
 
 Canonical copy: examples/colab_driver.py (the notebook and colab_run.py copy it to /content).
-Reads /content/run_config.json. Runs shards from a manifest, one at a time, until none are left
-to claim, then exits (and releases the Colab runtime if COLAB_AUTO_UNASSIGN=1).
+Reads /content/run_config.json. Runs shards from a manifest until none are left to claim, then
+exits (and releases the Colab runtime if COLAB_AUTO_UNASSIGN=1).
+
+PIPELINE (default 2) shards run at once on the one GPU: spliceai takes a file lock for its GPU
+phase only, so while one shard is in its CPU-only phases (batch preparation before inference,
+output writing after) the other holds the GPU. Each shard gets its own scratch dir under
+LOCAL_TMP, so scratch peaks at PIPELINE x one shard's footprint.
 
 Shared state (claims, .done markers, manifest, logs) and bulk data (shards, results) live in ONE
 of two stores, chosen by the config:
@@ -175,16 +180,19 @@ def run_shard(s):
             log(f"{sid}: bcftools conversion failed"); return False
     out = f"{C['LOCAL_OUT']}/{sid}{OUT_EXT}"
     for stale in glob.glob(f"{C['LOCAL_OUT']}/{sid}*"): os.remove(stale)
+    tmp = f"{C['LOCAL_TMP']}/{sid}"                      # per-shard scratch: shards run concurrently
+    shutil.rmtree(tmp, ignore_errors=True); os.makedirs(tmp, exist_ok=True)
     cmd = ["spliceai", "-I", bcf, "-O", out, "-R", C["LOCAL_REF"], "-A", C["ANNOTATION"],
            "-D", str(C["DISTANCE"]), "-G", "all", "--precision", C["PRECISION"],
            "-B", str(C["PRED_BATCH"]), "-T", str(C["TORCH_BATCH"]),
-           "--batch-workers", str(C["BATCH_WORKERS"]), "-t", C["LOCAL_TMP"], "-V"]
+           "--batch-workers", str(C["BATCH_WORKERS"]), "-t", tmp, "-V"]
     if C.get("ORIG_OUTPUT"):
         cmd.append("--orig-output")
     if C.get("VCF_OUTPUT"):
         cmd.append("--vcf-output")
     cmd += C["EXTRA_FLAGS"].split()
-    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}
+    env = {**os.environ, "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+           "SPLICEAI_GPU_LOCK": f"{C['LOCAL_TMP']}/gpu.lock"}   # one process in the GPU phase at a time
     log(f"{sid}: start ({s['chrom']}:{s['start']}-{s['end']}, {s.get('n', '?')} records)")
     t0 = time.time()
     rc = subprocess.run(cmd, env=env).returncode
@@ -194,37 +202,67 @@ def run_shard(s):
     final = store.put_result(sid, out)
     store.mark_done(sid, f"{SESSION} {time.strftime('%Y-%m-%dT%H:%M:%S')} {size} {final}\n")
     log(f"{sid}: done in {(time.time()-t0)/3600:.2f} h, {size/1e6:.0f} MB -> {final}")
-    shutil.rmtree(C["LOCAL_TMP"], ignore_errors=True); os.makedirs(C["LOCAL_TMP"], exist_ok=True)
+    shutil.rmtree(tmp, ignore_errors=True)
     for stale in glob.glob(f"{bcf}*"): os.remove(stale)   # free local disk before the next shard is fetched
     return True
 
 
 shards = json.load(open(C["MANIFEST"]))
-log(f"session {SESSION}; store {'GCS ' + C['GCS_ROOT'] if C.get('GCS_ROOT') else 'Drive ' + C['DRIVE_OUT']}")
-while True:
-    todo = [s for s in shards if not store.finished(s["id"])]
-    if not todo:
-        log("all shards finished"); break
-    picked = None
-    for s in todo:
-        age = store.claim_state(s["id"])
-        if age is not None:
-            if age > STALE_MIN:
-                log(f"{s['id']}: taking over stale claim ({age:.0f} min)"); store.release_claim(s["id"])
-            else:
-                continue
-        if store.try_claim(s["id"]):
-            picked = s; break
-    if picked is None:
-        log(f"{len(todo)} shard(s) still running in other sessions; nothing left to claim here"); break
-    stop = threading.Event()
-    threading.Thread(target=heartbeat, args=(picked["id"], stop), daemon=True).start()
-    ok = run_shard(picked)
-    stop.set()
-    store.release_claim(picked["id"])
-    store.sync_log()
-    if not ok:
-        sys.exit(1)
+claim_lock = threading.Lock()          # serialises claiming within this process (the store makes it atomic across sessions)
+failed = threading.Event()
+
+
+def claim_next():
+    with claim_lock:
+        todo = [s for s in shards if not store.finished(s["id"])]
+        if not todo:
+            return None, 0
+        for s in todo:
+            age = store.claim_state(s["id"])
+            if age is not None:
+                if age > STALE_MIN:
+                    log(f"{s['id']}: taking over stale claim ({age:.0f} min)"); store.release_claim(s["id"])
+                else:
+                    continue
+            if store.try_claim(s["id"]):
+                return s, len(todo)
+        return None, len(todo)
+
+
+def worker_loop(k):
+    """Claim and run shards until none are left. PIPELINE of these run at once; the GPU lock
+    inside spliceai means one is in its GPU phase while the others prepare batches or write."""
+    while not failed.is_set():
+        picked, left = claim_next()
+        if picked is None:
+            log(f"[w{k}] " + ("all shards finished" if left == 0 else
+                               f"{left} shard(s) still in flight (this or another session); nothing left to claim"))
+            return
+        stop = threading.Event()
+        threading.Thread(target=heartbeat, args=(picked["id"], stop), daemon=True).start()
+        try:
+            ok = run_shard(picked)
+        except Exception as e:
+            log(f"[w{k}] {picked['id']}: exception {e!r}"); ok = False
+        stop.set()
+        store.release_claim(picked["id"])
+        store.sync_log()
+        if not ok:
+            failed.set(); return
+
+
+PIPELINE = max(1, int(C.get("PIPELINE", 2)))
+log(f"session {SESSION}; store {'GCS ' + C['GCS_ROOT'] if C.get('GCS_ROOT') else 'Drive ' + C['DRIVE_OUT']}; "
+    f"{PIPELINE} pipelined shard(s) per GPU")
+os.makedirs(C["LOCAL_TMP"], exist_ok=True)
+threads = []
+for k in range(PIPELINE):
+    t = threading.Thread(target=worker_loop, args=(k,), daemon=True); t.start(); threads.append(t)
+    if k + 1 < PIPELINE: time.sleep(int(C.get("PIPELINE_STAGGER_S", 60)))   # let shard 1 reach the GPU before shard 2 starts prepping
+for t in threads:
+    t.join()
+if failed.is_set():
+    log("a shard failed; exiting without releasing the runtime"); store.sync_log(); sys.exit(1)
 
 log("DRIVER EXIT")
 store.sync_log()
