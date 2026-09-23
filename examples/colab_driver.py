@@ -189,6 +189,7 @@ def run_shard(s):
     store.mark_done(sid, f"{SESSION} {time.strftime('%Y-%m-%dT%H:%M:%S')} {size} {final}\n")
     log(f"{sid}: done in {(time.time()-t0)/3600:.2f} h, {size/1e6:.0f} MB -> {final}")
     shutil.rmtree(C["LOCAL_TMP"], ignore_errors=True); os.makedirs(C["LOCAL_TMP"], exist_ok=True)
+    for stale in glob.glob(f"{bcf}*"): os.remove(stale)   # free local disk before the next shard is fetched
     return True
 
 
