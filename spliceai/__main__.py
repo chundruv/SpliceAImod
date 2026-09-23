@@ -424,7 +424,6 @@ def run_spliceai_batched(args, ann, devices, device_info):
         # Use the high-performance VCFWriter from data_handlers
         import shelve
         import pickle
-        import shutil
 
         shelf_path = os.path.join(tmpdir, 'shelf_records.db')
         pickle.dump(shared_dict, open(os.path.join(tmpdir, 'shared_dict.pkl'), 'wb'))

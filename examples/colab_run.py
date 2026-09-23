@@ -227,7 +227,11 @@ def launch_driver():
         log("driver already running"); return
     logf = f"{CFG['DRIVE_LOGS']}/driver_{time.strftime('%Y%m%d_%H%M%S')}.log"
     env = {**os.environ, "COLAB_AUTO_UNASSIGN": AUTO_UNASSIGN, "DRIVER_LOG": logf}
-    subprocess.Popen(f"nohup python3 /content/colab_driver.py > {logf} 2>&1 &", shell=True, env=env)
+    # Own session (setsid): a notebook "interrupt" sends SIGINT to the kernel's whole process
+    # group, and spliceai installs a SIGINT handler that exits -- so under plain nohup an
+    # interrupted cell silently killed the shard in flight while the driver survived.
+    subprocess.Popen(["python3", "/content/colab_driver.py"], stdout=open(logf, "ab"),
+                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True, env=env)
     log(f"driver launched; log: {logf}")
 
 
