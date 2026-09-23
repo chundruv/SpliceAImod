@@ -336,7 +336,7 @@ class VCFWriter:
         # field NAMES, field COUNT, and in whether EVENT_CLASS existed at all).
         if self.orig:
             header.add_line(
-                '##INFO=<ID=SpliceAI_orig,Number=.,Type=String,Description="'
+                '##INFO=<ID=SpliceAI,Number=.,Type=String,Description="'
                 + info_header_description(orig=True) + '">')
         else:
             header.add_line(

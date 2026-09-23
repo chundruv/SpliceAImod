@@ -543,7 +543,7 @@ def run_spliceai(args, ann):
         header = vcf.header
         if args.orig_output:
             header.add_line(
-                '##INFO=<ID=SpliceAI_orig,Number=.,Type=String,Description="'
+                '##INFO=<ID=SpliceAI,Number=.,Type=String,Description="'
                 + info_header_description(orig=True) + '">')
         else:
             header.add_line(
