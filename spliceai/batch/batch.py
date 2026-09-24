@@ -647,7 +647,7 @@ class VCFPredictionBatch:
                     pass
 
     def _warmup_models(self):
-        """Warmup with actual batch sizes to trigger torch.compile and cuDNN autotuning"""
+        """Initialise CUDA-graph state. (Historically also ran dummy forward passes; see below.)"""
         if self.warmup_done:
             return
 
@@ -660,16 +660,7 @@ class VCFPredictionBatch:
         self.logger.info(f"Worker {self.worker_id}: Warming up...")
         warmup_start = time.time()
 
-        # Window the batch producers actually emit: 10000 bp of context plus
-        # the +/- distance region. The old hardcoded 25001 never matched a real
-        # batch at -D 500 (11001), so the graph captured here was never replayed
-        # and every batch ran eager.
-        SPLICEAI_INPUT_LENGTH = 10000 + 2 * int(getattr(self.args, 'distance', 500) or 500) + 1
-        batch_size = self.pytorch_batch_size or 128
-        
-        # Get model dtype
-        model_dtype = next(self.ann.models[0].parameters()).dtype
-        self.logger.info(f"Worker {self.worker_id}: Model dtype = {model_dtype}")
+        self.logger.info(f"Worker {self.worker_id}: Model dtype = {next(self.ann.models[0].parameters()).dtype}")
 
         # Initialize CUDA graph storage
         self.cuda_graphs = {}
@@ -685,47 +676,12 @@ class VCFPredictionBatch:
         no_cuda_graphs_flag = getattr(self.args, 'no_cuda_graphs', False)
         self.use_cuda_graphs = (not is_cpu) and torch.cuda.is_available() and not no_cuda_graphs_flag
         
-        # Warm up at the real (batch, length) shape whether or not --compile is
-        # set. With --compile this is where Inductor traces and compiles the
-        # graph (~40 s on an A100), which otherwise lands on the first real
-        # batch. The GPU worker is ready long before the batch producers have
-        # filled their first batch, so doing it here overlaps the compile with
-        # that wait instead of serialising the two. Memory is the same as one
-        # inference chunk, so there is no OOM risk beyond what inference has.
-        use_compile = getattr(self.args, 'compile', False)
-        if use_compile:
-            self.logger.info(f"Worker {self.worker_id}: warming up compiled graph at "
-                             f"({batch_size}, 4, {SPLICEAI_INPUT_LENGTH}) while batches are prepared")
-
-        with torch.inference_mode():
-            for i in range(2):  # Fewer warmup iterations
-                try:
-                    dummy_input = torch.randn(
-                        batch_size, 4, SPLICEAI_INPUT_LENGTH,
-                        dtype=model_dtype,
-                        device=self.device
-                    )
-                    
-                    _ = self.ensemble_forward(dummy_input)
-                    
-                    if not is_cpu:
-                        torch.cuda.synchronize()
-                    
-                    del dummy_input
-                except Exception as e:
-                    self.logger.warning(f"Worker {self.worker_id}: Warmup iter {i} failed: {e}")
-
-        # Clean up after warmup to free compile cache memory
-        gc.collect()
-        if not is_cpu:
-            torch.cuda.empty_cache()
-            # Log memory after cleanup
-            try:
-                mem_used = torch.cuda.memory_allocated() / 1024**3
-                mem_reserved = torch.cuda.memory_reserved() / 1024**3
-                self.logger.info(f"Worker {self.worker_id}: Post-warmup memory: {mem_used:.1f}GB allocated, {mem_reserved:.1f}GB reserved")
-            except:
-                pass
+        # No dummy forward passes: the warm-up inference at a synthetic shape was observed to
+        # hang worker start-up on Colab (A100, --compile). torch.compile tracing, cuDNN
+        # autotuning and the lazy CUDA-graph capture all happen on the first real batch
+        # instead, which costs the same GPU time once per process and cannot get stuck
+        # waiting on a shape that never arrives.
+        self.logger.info(f"Worker {self.worker_id}: warm-up skipped; compile/autotune run on the first real batch")
 
         self.logger.info(f"Worker {self.worker_id}: CUDA graphs {'enabled (lazy capture)' if self.use_cuda_graphs else 'disabled'}")
         self.warmup_done = True
